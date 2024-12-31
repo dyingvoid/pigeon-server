@@ -1,9 +1,31 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 )
+
+// TODO custom errors perhaps
+func parseJson[T any](r *http.Request) (*T, []byte, error) {
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, body, fmt.Errorf("internal: %w", err)
+	}
+
+	var request T
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&request); err != nil {
+		return nil, body, fmt.Errorf("bad request: %w", err)
+	}
+
+	return &request, body, nil
+}
 
 func (context *HttpContext) writeJson(
 	w http.ResponseWriter, status int, data any, headers http.Header) error {
@@ -47,4 +69,8 @@ func (context *HttpContext) methodNotAllowed(w http.ResponseWriter) {
 
 func (context *HttpContext) badRequest(w http.ResponseWriter) {
 	http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+}
+
+func (context *HttpContext) unauthorized(w http.ResponseWriter) {
+	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 }

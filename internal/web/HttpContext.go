@@ -2,12 +2,15 @@ package web
 
 import (
 	"encoding/json"
-	"github.com/dyingvoid/pigeon-server/internal/application/models"
+	"github.com/dyingvoid/pigeon-server/internal/web/authentication"
+	"github.com/dyingvoid/pigeon-server/internal/web/requests"
 	"log"
 	"net/http"
+	"strings"
 )
 
 type HttpContext struct {
+	auth   *authentication.Authentication
 	logger *log.Logger
 }
 
@@ -23,14 +26,22 @@ func (context *HttpContext) AddUserHandler(w http.ResponseWriter, r *http.Reques
 		context.methodNotAllowed(w)
 	}
 
-	var signedUser models.SignedUser
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&signedUser); err != nil {
+	request, body, err := parseJson[requests.NewUserRequest](r)
+	if err != nil {
 		context.logger.Println(err)
+		if strings.HasPrefix(err.Error(), "internal") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
 		context.badRequest(w)
+		return
 	}
 
-	// TODO validation logic...
+	if err = context.auth.ValidateChallenge(request.GetSignature(), body); err != nil {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
 
 	// TODO writeJson
 	json.NewEncoder(w).Encode("validatedData")
