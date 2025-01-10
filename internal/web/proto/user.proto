@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package rpc_api;
+
+option go_package = "internal/protobuf/handlers";
+
+message AddUserRequest {
+  string username = 1;
+  bytes public_key = 2;
+}
+
+message AddUserResponse {
+  string message = 1;
+}
+
+service UserService {
+  rpc AddUser(AddUserRequest) returns (AddUserResponse);
+}
+
+message ChallengeRequest {
+
+}
+
+message ChallengeResponse {
+  bytes nonce = 1;
+}
+
+service ChallengeService {
+  rpc GetChallenge (ChallengeRequest) returns (ChallengeResponse);
+}
+

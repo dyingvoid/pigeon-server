@@ -1,96 +1,88 @@
 package authentication
 
 import (
+	"context"
 	"crypto"
-	"crypto/rand"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"errors"
 	"fmt"
-	"github.com/dyingvoid/pigeon-server/internal/web/requests"
+	"github.com/redis/go-redis/v9"
 	"time"
 )
 
 type Authentication struct {
-	challenges map[string]AuthChallenge
-	nonceSize  int
-	expiration time.Duration
+	redisClient *redis.Client
+	nonceSize   int
+	expiration  time.Duration
 }
 
-// AddChallenge adds new challenge to collection and returns it
-func (a *Authentication) AddChallenge() (AuthChallenge, error) {
-	nonce := make([]byte, a.nonceSize)
-	_, err := rand.Read(nonce)
+func (a *Authentication) CreateChallenge(ctx context.Context) (Challenge, error) {
+	challenge, err := NewAuthChallenge(a.nonceSize)
 	if err != nil {
-		return AuthChallenge{},
-			fmt.Errorf("could not generate nonce: %w", err)
+		return challenge, fmt.Errorf("could not create auth challenge: %w", err)
 	}
 
-	session := AuthChallenge{
-		Expiration: time.Now().Add(a.expiration),
-	}
-	a.challenges[string(nonce)] = session
-
-	return session, nil
-}
-
-func (a *Authentication) GetChallenge(nonce []byte) (AuthChallenge, error) {
-	challenge, ok := a.challenges[string(nonce)]
-	if !ok {
-		return AuthChallenge{}, fmt.Errorf("challenge not found")
+	err = a.redisClient.Set(ctx, challenge.Key(), challenge, a.expiration).Err()
+	if err != nil {
+		return challenge, fmt.Errorf("could not set redis auth challenge: %w", err)
 	}
 
 	return challenge, nil
 }
 
-// ValidateChallenge validates request's signature against corresponding json request's body
-func (a *Authentication) ValidateChallenge(signature requests.RequestSignature, requestBody []byte) error {
-	challenge, err := a.GetChallenge(signature.IssuedNonce)
+func (a *Authentication) ValidateChallengeResponse(ctx context.Context, response ChallengeResponse) error {
+	_, err := a.redisClient.Get(ctx, response.IssuedChallenge.Key()).Result()
+	if errors.Is(err, redis.Nil) {
+		return fmt.Errorf("challenge not found")
+	}
 	if err != nil {
-		return a.authError(err)
+		return fmt.Errorf("could not get challenge: %w", err)
 	}
 
-	if time.Now().After(challenge.Expiration) {
-		return a.authError(fmt.Errorf("challenge expired"))
-	}
-
-	rsaPublicKey, err := a.parseRsaPublicKey(signature.PublicKey)
+	parsedKey, err := x509.ParsePKIXPublicKey(response.PublicKey)
 	if err != nil {
-		return a.authError(err)
+		return fmt.Errorf("could not parse public key: %w", err)
 	}
 
-	hash := sha256.Sum256(requestBody)
-	err = rsa.VerifyPKCS1v15(rsaPublicKey, crypto.SHA256, hash[:], signature.Signature)
+	hash := sha256.Sum256(response.SignedData)
+	slice := hash[:]
+	switch publicKey := parsedKey.(type) {
+	case *rsa.PublicKey:
+		// TODO VerifyPSS is modern and has mathematical proof
+		err = rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, slice, response.Signature)
+	case *ecdsa.PublicKey:
+		res := ecdsa.VerifyASN1(publicKey, slice, response.Signature)
+		if res == false {
+			err = fmt.Errorf("ecdsa signature verification failed")
+		}
+	case ed25519.PublicKey:
+		if len(publicKey) != ed25519.PublicKeySize {
+			err = fmt.Errorf("invalid ed25519 public key size: %d", len(publicKey))
+		}
+
+		res := ed25519.Verify(publicKey, response.SignedData, response.Signature)
+		if res == false {
+			err = fmt.Errorf("ed25519 signature verification failed")
+		}
+	default:
+		err = fmt.Errorf("unknown public key type: %T", publicKey)
+	}
+
 	if err != nil {
-		return fmt.Errorf("could not verify signature: %w", err)
+		_ = a.redisClient.Del(ctx, response.IssuedChallenge.Key()).Err()
 	}
 
-	delete(a.challenges, string(signature.IssuedNonce))
-
-	return nil
+	return err
 }
 
-func (a *Authentication) parseRsaPublicKey(rsaBytes []byte) (*rsa.PublicKey, error) {
-	key, err := x509.ParsePKIXPublicKey(rsaBytes)
-	if err != nil {
-		return nil,
-			fmt.Errorf("could not parse RSA public key: %w", err)
+func NewAuthentication(redisClient *redis.Client, nonceSize int, expiration time.Duration) Authentication {
+	return Authentication{
+		redisClient: redisClient,
+		nonceSize:   nonceSize,
+		expiration:  expiration,
 	}
-
-	// TODO get information about casting
-	rsaKey, ok := key.(*rsa.PublicKey)
-	if !ok {
-		return nil,
-			fmt.Errorf("key is not an RSA public key")
-	}
-
-	return rsaKey, nil
-}
-
-func (a *Authentication) authError(err error) error {
-	return fmt.Errorf("authentication error: %w", err)
-}
-
-func NewSessionContainer() Authentication {
-	return Authentication{challenges: make(map[string]AuthChallenge)}
 }

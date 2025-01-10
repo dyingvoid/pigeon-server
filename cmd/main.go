@@ -1,80 +1,107 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"github.com/dyingvoid/pigeon-server/internal"
-	"github.com/gorilla/mux"
+	"github.com/dyingvoid/pigeon-server/internal/mongodb"
+	"github.com/dyingvoid/pigeon-server/internal/web/authentication"
+	"github.com/dyingvoid/pigeon-server/internal/web/handlers"
+	"github.com/dyingvoid/pigeon-server/internal/web/interceptors"
+	pb "github.com/dyingvoid/pigeon-server/internal/web/proto"
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 	"log"
-	"net/http"
+	"net"
 	"os"
+	"time"
 )
 
-const version = "dev#0"
-
-type config struct {
-	port string
-}
-
 type application struct {
-	config config
-	logger *log.Logger
-	db     *internal.Db
+	Auth   *authentication.Authentication
+	Logger *log.Logger
+	Mongo  *mongodb.Database
+	Redis  *redis.Client
 }
-
-const get = "GET"
 
 func main() {
+	db := NewMongo()
+	client := NewRedis()
+
 	logger := log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime)
-
-	db := internal.Db{
-		Users: make(map[string]internal.User),
-	}
-
-	for i := 0; i < 10; i++ {
-		db.AddUser(internal.NewUser(10))
-	}
+	auth := authentication.NewAuthentication(
+		client,
+		32,
+		10*time.Second,
+	)
 
 	app := application{
-		config: config{
-			port: ":8080",
-		},
-		logger: logger,
-		db:     &db,
+		Logger: logger,
+		Auth:   &auth,
+		Mongo:  db,
+		Redis:  client,
 	}
 
-	router := mux.NewRouter()
-	router.HandleFunc("/healthcheck", app.healthcheckHandler).Methods(get)
-	router.HandleFunc("/users", app.getAllUsersHandler).Methods(get)
+	errChan := make(chan error, 2)
+	go NewGRPC(&app, ":50051", errChan)
+	for err := range errChan {
+		if err != nil {
+			log.Fatalf("server error: %+v", err)
+		}
+	}
+}
 
-	log.Println("Starting server on port " + app.config.port)
-	err := http.ListenAndServe(app.config.port, router)
+func NewRedis() *redis.Client {
+	// TODO env file
+	// TODO what are the options?
+	options := &redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+		Protocol: 2,
+	}
+	return redis.NewClient(options)
+}
+
+func NewMongo() *mongodb.Database {
+	// TODO env file, or some building steps
+	dbConfig := mongodb.MongoConfig{
+		ConnectionString:   "mongodb://localhost:27017",
+		DatabaseName:       "pigeon",
+		UserCollectionName: "users",
+	}
+	db, err := mongodb.NewMongoDb(dbConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
+	return db
 }
 
-func (app *application) healthcheckHandler(w http.ResponseWriter, r *http.Request) {
-	js := `{"status": "available", "version": %q}`
-	js = fmt.Sprintf(js, version)
+func NewGRPC(app *application, port string, ch chan<- error) {
+	loggingInterceptor := interceptors.NewLoggingInterceptor(app.Logger)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(js))
-}
+	server := grpc.NewServer(
+		grpc.UnaryInterceptor(loggingInterceptor.Intercept),
+	)
 
-func (app *application) getAllUsersHandler(w http.ResponseWriter, r *http.Request) {
-	users := app.db.GetAllUsers()
+	userService := handlers.NewUserService(app.Mongo.UserRepository)
+	challengeService := handlers.NewChallengeService(app.Auth)
 
-	w.Header().Set("Content-Type", "application/json")
+	pb.RegisterUserServiceServer(server, userService)
+	pb.RegisterChallengeServiceServer(server, challengeService)
 
-	js, err := json.Marshal(users)
+	reflection.Register(server)
+
+	listener, err := net.Listen("tcp", port)
 	if err != nil {
-		app.logger.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		app.Logger.Println("grpc set up error")
+		ch <- fmt.Errorf("could not listen on port %s, %w", port, err)
 	}
 
-	js = append(js, '\n')
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(js)
+	app.Logger.Println("Starting GRPC server on port " + port)
+	if err = server.Serve(listener); err != nil {
+		app.Logger.Println("grpc set up error")
+		ch <- fmt.Errorf("could not start grpc server on port %s, %w", port, err)
+	}
+
+	ch <- nil
 }
